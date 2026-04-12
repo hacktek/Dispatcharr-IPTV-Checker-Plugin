@@ -9,7 +9,6 @@ import json
 import os
 import re
 import csv
-import fnmatch
 import time
 import threading
 import urllib.request
@@ -53,6 +52,9 @@ LOGGER.addFilter(PluginNameFilter())
 _bg_scheduler_thread = None
 _scheduler_stop_event = threading.Event()
 _scheduler_pending_run = False  # Flag to queue a run if check already in progress
+_active_check_thread = None
+_active_check_thread_lock = threading.Lock()
+_active_check_stop_event = threading.Event()
 
 LOG_PREFIX = "[IPTV Checker]"
 
@@ -64,6 +66,7 @@ class PluginConfig:
     RESULTS_FILE = "/data/iptv_checker_results.json"
     LOADED_CHANNELS_FILE = "/data/iptv_checker_loaded_channels.json"
     PROGRESS_FILE = "/data/iptv_checker_progress.json"
+    CANCEL_FILE = "/data/iptv_checker_cancel.flag"
 
     # --- Scheduler ---
     DEFAULT_TIMEZONE = "America/Chicago"
@@ -137,7 +140,7 @@ class Plugin:
     
     # Explicitly set the plugin key
     key = "iptv_checker"
-    version = "0.8.0"
+    version = "0.8.1"
 
     # Fields and actions are defined in plugin.json (single source of truth)
     def __init__(self):
@@ -146,9 +149,9 @@ class Plugin:
         self.progress_file = PluginConfig.PROGRESS_FILE
         self.check_progress = self._load_progress()
         self.load_progress = {"current": 0, "total": 0, "status": "idle"}  # Track load groups progress
-        self._thread = None
-        self._thread_lock = threading.Lock()
-        self._stop_event = threading.Event()
+        self._thread = _active_check_thread
+        self._thread_lock = _active_check_thread_lock
+        self._stop_event = _active_check_stop_event
         self.timeout_retry_queue = []  # Queue for streams that timed out and need retry
         self.version_check_cache = None  # Cached version check result
         self.version_check_time = None  # Time when version was last checked
@@ -157,11 +160,14 @@ class Plugin:
     def _try_start_thread(self, target, args):
         """Atomically check if a thread is running and start a new one.
         Returns True if started, False if another operation is running."""
+        global _active_check_thread
         with self._thread_lock:
+            self._thread = _active_check_thread
             if self._thread and self._thread.is_alive():
                 return False
-            self._stop_event.clear()
+            self._clear_cancel_requested()
             self._thread = threading.Thread(target=target, args=args, daemon=True)
+            _active_check_thread = self._thread
             self._thread.start()
             return True
 
@@ -174,6 +180,31 @@ class Plugin:
             except Exception as e:
                 LOGGER.warning(f"Failed to load progress file: {e}")
         return {"current": 0, "total": 0, "status": "idle", "start_time": None}
+
+    def _match_group_pattern(self, group_name, pattern):
+        """Match group names with '*' and '?' wildcards while treating brackets literally."""
+        regex = re.escape(pattern)
+        regex = regex.replace(r'\*', '.*').replace(r'\?', '.')
+        return re.fullmatch(regex, group_name) is not None
+
+    def _resolve_group_patterns(self, group_names, patterns):
+        """Resolve input patterns against known group names."""
+        matched_names = set()
+        unmatched_patterns = []
+
+        for pattern in patterns:
+            if '*' in pattern or '?' in pattern:
+                matches = {name for name in group_names if self._match_group_pattern(name, pattern)}
+                if matches:
+                    matched_names.update(matches)
+                else:
+                    unmatched_patterns.append(pattern)
+            elif pattern in group_names:
+                matched_names.add(pattern)
+            else:
+                unmatched_patterns.append(pattern)
+
+        return matched_names, unmatched_patterns
 
     def _save_progress(self):
         """Save check progress to persistent storage"""
@@ -197,6 +228,25 @@ class Plugin:
             LOGGER.error(f"Failed to load JSON file {filepath}: {e}")
             return None
 
+    def _is_cancel_requested(self):
+        return self._stop_event.is_set() or os.path.exists(PluginConfig.CANCEL_FILE)
+
+    def _set_cancel_requested(self):
+        self._set_cancel_requested()
+        try:
+            with open(PluginConfig.CANCEL_FILE, 'w') as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            LOGGER.error(f"Failed to create cancel flag: {e}")
+
+    def _clear_cancel_requested(self):
+        self._stop_event.clear()
+        try:
+            if os.path.exists(PluginConfig.CANCEL_FILE):
+                os.remove(PluginConfig.CANCEL_FILE)
+        except Exception as e:
+            LOGGER.warning(f"Failed to clear cancel flag: {e}")
+
     def _save_json_file(self, filepath, data, indent=None):
         """Atomically save data to a JSON file using temp file + rename."""
         try:
@@ -213,12 +263,16 @@ class Plugin:
                     pass
 
     def stop(self, context):
+        global _active_check_thread
         logger = context.get("logger", LOGGER)
         logger.info("Plugin unloading - stopping scheduler and active threads")
         self._stop_background_scheduler()
-        self._stop_event.set()
+        self._set_cancel_requested()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
+        with self._thread_lock:
+            if self._thread is _active_check_thread and (not self._thread or not self._thread.is_alive()):
+                _active_check_thread = None
     
     def _parse_scheduled_times(self, scheduled_times_str):
         """
@@ -721,20 +775,7 @@ class Plugin:
                     all_groups = self._get_all_groups(logger)
                     all_group_names = {g['name'] for g in all_groups}
                     input_names = [name.strip() for name in group_names_str.split(',') if name.strip()]
-                    matched_names = set()
-                    unmatched = []
-
-                    for pattern in input_names:
-                        if any(c in pattern for c in '*?['):
-                            matches = {g for g in all_group_names if fnmatch.fnmatchcase(g, pattern)}
-                            if matches:
-                                matched_names.update(matches)
-                            else:
-                                unmatched.append(pattern)
-                        elif pattern in all_group_names:
-                            matched_names.add(pattern)
-                        else:
-                            unmatched.append(pattern)
+                    matched_names, unmatched = self._resolve_group_patterns(all_group_names, input_names)
 
                     if matched_names:
                         validation_results.append(f"✅ Groups ({len(matched_names)}): {', '.join(sorted(matched_names))}")
@@ -1045,22 +1086,13 @@ class Plugin:
             else:
                 input_names = [name.strip() for name in group_names_str.split(',') if name.strip()]
                 all_group_names = set(group_name_to_id.keys())
-                target_group_names = set()
-                unmatched_patterns = []
+                target_group_names, unmatched_patterns = self._resolve_group_patterns(all_group_names, input_names)
 
                 for pattern in input_names:
-                    if any(c in pattern for c in '*?['):
-                        # Wildcard pattern — match against all group names
-                        matched = {g for g in all_group_names if fnmatch.fnmatchcase(g, pattern)}
+                    if '*' in pattern or '?' in pattern:
+                        matched = {g for g in target_group_names if self._match_group_pattern(g, pattern)}
                         if matched:
                             logger.info(f"✓ Pattern '{pattern}' matched {len(matched)} group(s): {', '.join(sorted(matched))}")
-                            target_group_names.update(matched)
-                        else:
-                            unmatched_patterns.append(pattern)
-                    elif pattern in group_name_to_id:
-                        target_group_names.add(pattern)
-                    else:
-                        unmatched_patterns.append(pattern)
 
                 target_group_ids = {group_name_to_id[name] for name in target_group_names}
 
@@ -1203,7 +1235,7 @@ class Plugin:
 
         try:
             for i, stream_data in enumerate(all_streams):
-                if self._stop_event.is_set():  # Allow early termination
+                if self._is_cancel_requested():  # Allow early termination
                     break
 
                 self.check_progress["current"] = i + 1
@@ -1277,6 +1309,8 @@ class Plugin:
 
             # Process any remaining timeout retries
             while self.timeout_retry_queue:
+                if self._is_cancel_requested():
+                    break
                 retry_stream = self.timeout_retry_queue.pop(0)
                 if retry_stream["retry_count"] < retries:
                     retry_stream["retry_count"] += 1
@@ -1307,11 +1341,16 @@ class Plugin:
         except Exception as e:
             logger.error(f"Background stream processing error: {e}")
         finally:
+            global _active_check_thread
+            with self._thread_lock:
+                if self._thread is _active_check_thread:
+                    _active_check_thread = None
             self.check_progress['status'] = 'idle'
             self.check_progress['end_time'] = time.time()
             self._save_progress()
             tracker.finish()
             self._trigger_frontend_refresh(settings, logger)
+            self._clear_cancel_requested()
 
     def _process_streams_parallel(self, all_streams, settings, logger):
         """Parallel stream processing using ThreadPoolExecutor"""
@@ -1345,8 +1384,8 @@ class Plugin:
 
                 # Process results as they complete
                 for future in as_completed(future_to_index):
-                    if self._stop_event.is_set():
-                        executor.shutdown(wait=False)
+                    if self._is_cancel_requested():
+                        executor.shutdown(wait=False, cancel_futures=True)
                         break
 
                     index = future_to_index[future]
@@ -1395,7 +1434,7 @@ class Plugin:
             results = [results_dict[i] for i in range(len(all_streams)) if i in results_dict]
 
             # Handle retries for streams with retryable errors if enabled
-            if retries > 0:
+            if retries > 0 and not self._is_cancel_requested():
                 retryable_errors = ['Timeout', 'Connection Refused', 'Network Unreachable', 'Stream Unreachable', 'Server Error']
                 retry_streams = [(i, r) for i, r in enumerate(results) if r.get('error_type') in retryable_errors]
 
@@ -1403,6 +1442,8 @@ class Plugin:
                     logger.info(f"Found {len(retry_streams)} streams with retryable errors, retrying...")
 
                     for retry_pass in range(retries):
+                        if self._is_cancel_requested():
+                            break
                         if not retry_streams:
                             break
 
@@ -1419,6 +1460,9 @@ class Plugin:
                             }
 
                             for future in as_completed(future_to_result_index):
+                                if self._is_cancel_requested():
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                    break
                                 result_index = future_to_result_index[future]
                                 try:
                                     retry_result = future.result()
@@ -1449,11 +1493,18 @@ class Plugin:
         except Exception as e:
             logger.error(f"Background parallel stream processing error: {e}")
         finally:
+            global _active_check_thread
+            with self._thread_lock:
+                if self._thread is _active_check_thread:
+                    _active_check_thread = None
+            if self._is_cancel_requested():
+                logger.info(f"Parallel stream processing stopped. Saved partial results for {len(results)} streams.")
             self.check_progress['status'] = 'idle'
             self.check_progress['end_time'] = time.time()
             self._save_progress()
             tracker.finish()
             self._trigger_frontend_refresh(settings, logger)
+            self._clear_cancel_requested()
 
     def rename_channels_action(self, settings, logger):
         """Rename channels that were marked as dead in the last check."""
@@ -2173,6 +2224,11 @@ class Plugin:
             'ffprobe_monitoring_seconds': 0
         }
 
+        if self._is_cancel_requested():
+            default_return['error'] = 'Stream check cancelled'
+            default_return['error_type'] = 'Cancelled'
+            return default_return
+
         # Log stream check start at DEBUG level (reduced verbosity)
         retry_info = f" (retry {retry_attempt})" if retry_attempt > 0 else ""
         logger.debug(f"Checking stream{retry_info}: '{channel_name}' - URL: {url}")
@@ -2240,8 +2296,39 @@ class Plugin:
         logger.debug(f"Executing ffprobe command for '{channel_name}': {' '.join(cmd)}")
 
         for attempt in range(max_attempts):
+            if self._is_cancel_requested():
+                last_error = 'Stream check cancelled'
+                last_error_type = 'Cancelled'
+                break
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=total_timeout)
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.time() + total_timeout
+
+                while True:
+                    if self._is_cancel_requested():
+                        process.kill()
+                        process.communicate()
+                        last_error = 'Stream check cancelled'
+                        last_error_type = 'Cancelled'
+                        break
+
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        process.kill()
+                        process.communicate()
+                        raise subprocess.TimeoutExpired(cmd, total_timeout)
+
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                        result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                else:
+                    result = None
+
+                if last_error_type == 'Cancelled':
+                    break
 
                 if result.returncode == 0:
                     probe_data = json.loads(result.stdout)
@@ -2401,9 +2488,14 @@ class Plugin:
                 last_error_type = 'Other'
 
             # Only do immediate retries if not skipping them and not the last attempt
-            if not skip_retries and attempt < max_attempts - 1:
+            if not skip_retries and attempt < max_attempts - 1 and not self._is_cancel_requested():
                 logger.debug(f"Channel '{channel_name}' stream check failed. Retrying ({attempt+1}/{retries})...")
                 time.sleep(1)
+
+        if last_error_type == 'Cancelled':
+            default_return['error'] = last_error
+            default_return['error_type'] = last_error_type
+            return default_return
 
         # Log final result once if stream is dead after all attempts
         logger.info(f"✗ '{channel_name}' DEAD - {last_error_type}")
