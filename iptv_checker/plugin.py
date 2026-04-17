@@ -173,13 +173,19 @@ class Plugin:
 
     def _load_progress(self):
         """Load check progress from persistent storage"""
+        default_progress = {"current": 0, "total": 0, "status": "idle", "start_time": None}
         if os.path.exists(self.progress_file):
             try:
                 with open(self.progress_file, 'r') as f:
-                    return json.load(f)
+                    raw_progress = f.read().strip()
+                if not raw_progress:
+                    return default_progress
+                return json.loads(raw_progress)
+            except (json.JSONDecodeError, ValueError) as e:
+                LOGGER.warning(f"Failed to load progress file: {e}")
             except Exception as e:
                 LOGGER.warning(f"Failed to load progress file: {e}")
-        return {"current": 0, "total": 0, "status": "idle", "start_time": None}
+        return default_progress
 
     def _match_group_pattern(self, group_name, pattern):
         """Match group names with '*' and '?' wildcards while treating brackets literally."""
@@ -207,12 +213,20 @@ class Plugin:
         return matched_names, unmatched_patterns
 
     def _save_progress(self):
-        """Save check progress to persistent storage"""
+        """Atomically save check progress to persistent storage."""
         try:
-            with open(self.progress_file, 'w') as f:
+            os.makedirs(os.path.dirname(self.progress_file), exist_ok=True)
+            tmp_path = self.progress_file + '.tmp'
+            with open(tmp_path, 'w') as f:
                 json.dump(self.check_progress, f)
+            os.replace(tmp_path, self.progress_file)
         except Exception as e:
             LOGGER.error(f"Failed to save progress file: {e}")
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _load_json_file(self, filepath):
         """Safely load a JSON file, returning None if corrupted or missing."""
@@ -229,7 +243,10 @@ class Plugin:
             return None
 
     def _is_cancel_requested(self):
-        return self._stop_event.is_set() or os.path.exists(PluginConfig.CANCEL_FILE)
+        if self._stop_event.is_set() or os.path.exists(PluginConfig.CANCEL_FILE):
+            return True
+        progress = self._load_progress()
+        return progress.get('status') == 'cancelling'
 
     def _set_cancel_requested(self):
         self._set_cancel_requested()
@@ -874,7 +891,7 @@ class Plugin:
             return {"status": "ok", "message": f"📥 Loading channels {current}/{total} - {percent:.0f}% complete | {eta_str}"}
 
         # Check if stream check is in progress
-        if self.check_progress['status'] == 'running':
+        if self.check_progress['status'] in ('running', 'cancelling'):
             current, total = self.check_progress['current'], self.check_progress['total']
             percent = (current / total * 100) if total > 0 else 0
             if self.check_progress.get('start_time') and current > 0:
@@ -883,6 +900,8 @@ class Plugin:
                 eta_str = f"ETA: {ProgressTracker.format_eta(remaining)}"
             else:
                 eta_str = "ETA: calculating..."
+            if self.check_progress['status'] == 'cancelling':
+                return {"status": "ok", "message": f"🛑 Cancelling stream check {current}/{total} - {percent:.0f}% complete | {eta_str}"}
             return {"status": "ok", "message": f"🔄 Checking streams {current}/{total} - {percent:.0f}% complete | {eta_str}"}
 
         return {"status": "ok", "message": "No operation is currently running.\n\nUse '📥 Load Group(s)' to load channels or '▶️ Start Stream Check' to begin checking streams."}
@@ -892,18 +911,18 @@ class Plugin:
         # Reload progress from file to get latest state
         self.check_progress = self._load_progress()
 
-        if self.check_progress['status'] != 'running':
+        if self.check_progress['status'] not in ('running', 'cancelling'):
             return {"status": "ok", "message": "No stream check is currently running."}
 
         # Signal the background thread to stop
-        self._stop_event.set()
+        self._set_cancel_requested()
 
         # Get current progress for the message
         current = self.check_progress['current']
         total = self.check_progress['total']
 
-        # Reset status to idle
-        self.check_progress['status'] = 'idle'
+        # Mark cancellation requested. Worker will set idle when fully stopped.
+        self.check_progress['status'] = 'cancelling'
         self._save_progress()
 
         logger.info(f"Stream check cancelled by user. Processed {current}/{total} streams before cancellation.")
