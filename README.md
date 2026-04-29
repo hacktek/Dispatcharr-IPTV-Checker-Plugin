@@ -124,13 +124,15 @@ To update the plugin:
 | FFprobe Path | string | `/usr/local/bin/ffprobe` | Full path to the ffprobe executable |
 | FFprobe Analysis Flags | string | `-show_streams,-show_frames,...` | Comma-separated FFprobe flags |
 | FFprobe Analysis Duration | number | 5 | Seconds of stream to analyze |
+| Streamlink-Only Hosts | string | `youtube.com, youtu.be, twitch.tv, kick.com` | Comma-separated host suffixes ffprobe cannot validate (served via Streamlink). Streams matching these hosts are marked **Skipped** instead of **Dead**, so rename/move/delete actions leave them alone. Blank falls back to defaults. |
 
 ### Parallel Checking
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | Enable Parallel Checking | boolean | true | Check multiple streams simultaneously |
-| Number of Parallel Workers | number | 2 | How many streams to check at once |
+| Number of Parallel Workers | number | 2 | How many streams to check at once. **Keep below your provider's concurrent-connection limit.** |
+| Per-Stream Cooldown (seconds) | number | 2 | Each worker waits this long after finishing a check before picking up the next. Prevents provider rate-limiting / slot-reuse errors. Retry passes wait 3× this value. |
 
 ### Webhook
 
@@ -220,7 +222,7 @@ To update the plugin:
 - **Load Group(s):** Load channels from specified groups (async for large lists)
 - **Start Stream Check:** Begin checking all loaded streams in background thread
 - **View Check Progress:** View current progress and ETA of the running check
-- **Cancel Stream Check:** Stop the currently running stream check
+- **Cancel Stream Check:** Stop the currently running stream check (confirmation dialog; queued and in-flight streams abort, already-probed results are kept)
 - **View Last Results:** View summary of the last completed stream check
 
 ### Channel Management
@@ -261,6 +263,15 @@ Use shell-style wildcards in the Group(s) to Check field:
 - Provides server recovery time between retry attempts
 - Retry queue processes every 4 streams to balance throughput and recovery
 - Multiple retry attempts per stream based on configured retry count
+- **Retry-aware ETA:** `View Check Progress` keeps the percentage and ETA honest through retry passes — it no longer snaps to 100% at the end of the first pass.
+
+### Provider Concurrency Limits
+Most IPTV providers cap concurrent connections per account (often 1–4). Two settings let you stay under the cap while still running checks in parallel:
+
+- **Number of Parallel Workers** — keep this **below** your account's cap. For a 4-stream account, 2 workers leaves headroom for viewing while a check runs.
+- **Per-Stream Cooldown** — 2 s by default. Each worker waits this long after finishing before picking up the next stream, so the upstream slot has time to release. Retry passes wait `3×` this value.
+
+If you see a lot of "Server Error" or "Stream Unreachable" results that turn alive on retry, raise the cooldown or drop the worker count.
 
 ### Auto-Delete Dead Channels
 - Permanently deletes channels with dead streams from the database
@@ -287,10 +298,12 @@ docker restart dispatcharr
 - Restart Dispatcharr container
 
 **Scheduler Not Running:**
+- The scheduler starts automatically on container boot — no UI action needed
 - Verify `pytz` is installed in the container
 - Check cron syntax (5 fields required: minute hour day month weekday)
 - Use **Check Scheduler Status** to verify state
 - Check logs: `docker logs dispatcharr | grep -i scheduler`
+- Confirm scheduler started on boot: `docker logs dispatcharr | grep "Background scheduler thread started"`
 
 **Stream Check Failures:**
 - Increase connection timeout and/or probe timeout for slow streams
@@ -312,6 +325,10 @@ docker restart dispatcharr
 - **Settings:** `/data/iptv_checker_settings.json`
 - **CSV Exports:** `/data/exports/iptv_checker_results_YYYYMMDD_HHMMSS.csv`
 
+## Versioning
+
+This plugin uses calver `1.26.{DDD}{HHMM}` (UTC day-of-year + UTC hour-minute), matching the Lineuparr / Channel-Mapparr / EPG-Janitor cohort. Releases prior to `1.26.1081815` used semver (`0.X.Y`). See the [release notes](https://github.com/PiratesIRC/Dispatcharr-IPTV-Checker-Plugin/releases) for full changelogs.
+
 ## Contributing
 
 When reporting issues:
@@ -320,3 +337,44 @@ When reporting issues:
 3. Test with small channel groups first
 4. Document specific error messages and error types
 5. Note current progress from **View Last Results**
+
+Pull requests welcome. To submit changes:
+
+### To this repo (PiratesIRC/Dispatcharr-IPTV-Checker-Plugin)
+
+1. Bump version: `python3 bump_version.py` (auto-stamps with current UTC day-of-year + HHMM).
+2. Commit, push, tag, and release:
+
+```bash
+git tag <version> && git push origin <version>
+gh release create <version> --title "v<version>" --notes "..."
+gh release upload <version> iptv_checker.zip
+```
+
+### To the upstream marketplace (Dispatcharr/Plugins)
+
+Updates also need to be PR'd to `Dispatcharr/Plugins` so the plugin updates in users' Dispatcharr UIs. The repo's GitHub Actions validator enforces strict rules — failing any blocks the merge:
+
+| Check | Requirement |
+|-------|-------------|
+| PR title | Must match `[iptv-checker]: <description>`. The `validate-title` job fails on any other format. Most common trip-up. |
+| Version bump | `plugin.json` version must be greater than the version on upstream `main` for any code/asset change. Metadata-only edits are exempt. |
+| Required `plugin.json` fields | `name`, `version`, `description`, `author`, `license` (SPDX). |
+| Authorship | PR author's GitHub username must appear in `author` or `maintainers`, or the `close-unauthorized` job auto-closes the PR. |
+| Folder name | `plugins/iptv-checker/` (lowercase-kebab) — note this differs from the `iptv_checker/` snake_case used inside this repo's zip. |
+
+Workflow:
+
+```bash
+# In your fork of Dispatcharr/Plugins:
+git fetch upstream && git checkout main && git merge upstream/main --ff-only && git push origin main
+git checkout -b iptv-checker-v<version>
+cp <this-repo>/plugin.{py,json} plugins/iptv-checker/
+git commit -am "[iptv-checker]: ..."
+git push -u origin iptv-checker-v<version>
+gh pr create --repo Dispatcharr/Plugins --base main \
+    --title "[iptv-checker]: Bump to v<version> — <summary>" \
+    --body "..."
+```
+
+On merge, upstream automation builds the zip + checksums and updates `manifest.json` on the `releases` branch — do not touch that branch manually.
